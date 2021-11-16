@@ -75,7 +75,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -86,7 +85,6 @@ import (
 var (
 	flagAdd  = flag.Bool("add", false, "add a key")
 	flagList = flag.Bool("list", false, "list keys")
-	flagHotp = flag.Bool("hotp", false, "add key as HOTP (counter-based) key")
 	flag7    = flag.Bool("7", false, "generate 7-digit code")
 	flag8    = flag.Bool("8", false, "generate 8-digit code")
 	flagClip = flag.Bool("clip", false, "copy code to the clipboard")
@@ -94,7 +92,7 @@ var (
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage:\n")
-	fmt.Fprintf(os.Stderr, "\t2fa -add [-7] [-8] [-hotp] keyname\n")
+	fmt.Fprintf(os.Stderr, "\t2fa -add [-7] [-8] keyname\n")
 	fmt.Fprintf(os.Stderr, "\t2fa -list\n")
 	fmt.Fprintf(os.Stderr, "\t2fa [-clip] keyname\n")
 	os.Exit(2)
@@ -148,10 +146,7 @@ type Keychain struct {
 type Key struct {
 	raw    []byte
 	digits int
-	offset int // offset of counter
 }
-
-const counterLen = 20
 
 func readKeychain(file string) *Keychain {
 	c := &Keychain{
@@ -186,18 +181,6 @@ func readKeychain(file string) *Keychain {
 				if len(f) == 3 {
 					c.keys[name] = k
 					continue
-				}
-				if len(f) == 4 && len(f[3]) == counterLen {
-					_, err := strconv.ParseUint(string(f[3]), 10, 64)
-					if err == nil {
-						// Valid counter.
-						k.offset = offset - counterLen
-						if line[len(line)-1] == '\n' {
-							k.offset--
-						}
-						c.keys[name] = k
-						continue
-					}
 				}
 			}
 		}
@@ -247,9 +230,6 @@ func (c *Keychain) add(name string) {
 	}
 
 	line := fmt.Sprintf("%s %d %s", name, size, text)
-	if *flagHotp {
-		line += " " + strings.Repeat("0", 20)
-	}
 	line += "\n"
 
 	f, err := os.OpenFile(c.file, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
@@ -271,28 +251,7 @@ func (c *Keychain) code(name string) string {
 	if !ok {
 		log.Fatalf("no such key %q", name)
 	}
-	var code int
-	if k.offset != 0 {
-		n, err := strconv.ParseUint(string(c.data[k.offset:k.offset+counterLen]), 10, 64)
-		if err != nil {
-			log.Fatalf("malformed key counter for %q (%q)", name, c.data[k.offset:k.offset+counterLen])
-		}
-		n++
-		code = hotp(k.raw, n, k.digits)
-		f, err := os.OpenFile(c.file, os.O_RDWR, 0600)
-		if err != nil {
-			log.Fatalf("opening keychain: %v", err)
-		}
-		if _, err := f.WriteAt([]byte(fmt.Sprintf("%0*d", counterLen, n)), int64(k.offset)); err != nil {
-			log.Fatalf("updating keychain: %v", err)
-		}
-		if err := f.Close(); err != nil {
-			log.Fatalf("updating keychain: %v", err)
-		}
-	} else {
-		// Time-based key.
-		code = totp(k.raw, time.Now(), k.digits)
-	}
+	code := totp(k.raw, time.Now(), k.digits)
 	return fmt.Sprintf("%0*d", k.digits, code)
 }
 
@@ -315,11 +274,7 @@ func (c *Keychain) showAll() {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		k := c.keys[name]
-		code := strings.Repeat("-", k.digits)
-		if k.offset == 0 {
-			code = c.code(name)
-		}
+		code := c.code(name)
 		fmt.Printf("%-*s\t%s\n", max, code, name)
 	}
 }
