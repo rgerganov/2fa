@@ -64,18 +64,25 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"golang.org/x/term"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -85,15 +92,18 @@ import (
 var (
 	flagAdd  = flag.Bool("add", false, "add a key")
 	flagList = flag.Bool("list", false, "list keys")
+	flagDump = flag.Bool("dump", false, "dump keys")
 	flag7    = flag.Bool("7", false, "generate 7-digit code")
 	flag8    = flag.Bool("8", false, "generate 8-digit code")
 	flagClip = flag.Bool("clip", false, "copy code to the clipboard")
+	pwd      []byte
 )
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage:\n")
 	fmt.Fprintf(os.Stderr, "\t2fa -add [-7] [-8] keyname\n")
 	fmt.Fprintf(os.Stderr, "\t2fa -list\n")
+	fmt.Fprintf(os.Stderr, "\t2fa -dump\n")
 	fmt.Fprintf(os.Stderr, "\t2fa [-clip] keyname\n")
 	os.Exit(2)
 }
@@ -104,6 +114,12 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
+	var err error
+	fmt.Print("Enter Password:\n")
+	pwd, err = term.ReadPassword(int(syscall.Stdin))
+	if err != nil {
+		log.Fatal("cannot read password")
+	}
 	k := readKeychain(filepath.Join(os.Getenv("HOME"), ".2fa"))
 
 	if *flagList {
@@ -111,6 +127,13 @@ func main() {
 			usage()
 		}
 		k.list()
+		return
+	}
+	if *flagDump {
+		if flag.NArg() != 0 {
+			usage()
+		}
+		fmt.Printf("%s", k.data)
 		return
 	}
 	if flag.NArg() == 0 && !*flagAdd {
@@ -148,16 +171,52 @@ type Key struct {
 	digits int
 }
 
+func decrypt(ciphertext []byte) ([]byte, error) {
+	key := sha256.Sum256(pwd)
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := ciphertext[:gcm.NonceSize()]
+	ciphertext = ciphertext[gcm.NonceSize():]
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
+func encrypt(plaintext []byte) ([]byte, error) {
+	key := sha256.Sum256(pwd)
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
 func readKeychain(file string) *Keychain {
 	c := &Keychain{
 		file: file,
 		keys: make(map[string]Key),
 	}
-	data, err := ioutil.ReadFile(file)
+	ciphertext, err := ioutil.ReadFile(file)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return c
 		}
+		log.Fatal(err)
+	}
+	data, err := decrypt(ciphertext)
+	if err != nil {
 		log.Fatal(err)
 	}
 	c.data = data
@@ -232,16 +291,12 @@ func (c *Keychain) add(name string) {
 	line := fmt.Sprintf("%s %d %s", name, size, text)
 	line += "\n"
 
-	f, err := os.OpenFile(c.file, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	c.data = append(c.data, []byte(line)...)
+	cipher, err := encrypt(c.data)
 	if err != nil {
-		log.Fatalf("opening keychain: %v", err)
+		log.Fatalf("encrypting: %v", err)
 	}
-	f.Chmod(0600)
-
-	if _, err := f.Write([]byte(line)); err != nil {
-		log.Fatalf("adding key: %v", err)
-	}
-	if err := f.Close(); err != nil {
+	if err := os.WriteFile(c.file, cipher, 0600); err != nil {
 		log.Fatalf("adding key: %v", err)
 	}
 }
